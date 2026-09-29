@@ -1,0 +1,13 @@
+# environments (rebuild with  uv sync --all-extras  or  pip install -r requirements.txt)
+.venv/
+.tesseract/
+
+# build and editor leftovers
+__pycache__/
+*.egg-info/
+.ipynb_checkpoints/
+.DS_Store
+
+# Tesseract's Thai model, downloaded with
+#   curl -L -o tessdata/tha.traineddata https://github.com/tesseract-ocr/tessdata_best/raw/main/tha.traineddata
+tessdata/

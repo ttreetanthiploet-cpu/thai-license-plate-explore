@@ -1,0 +1,36 @@
+# Python 3.11+ (numpy 2.3 needs 3.11). Versions pinned to the tested environment.
+
+# --- core (thai_plate_reader.py, train_letter_cnn.py) ------------------------
+easyocr==1.7.2
+opencv-python-headless==5.0.0.93
+numpy==2.3.2
+torch==2.14.0
+torchvision==0.29.0
+pillow==11.3.0
+
+# --- example.ipynb -------------------------------------------------------------
+matplotlib==3.10.6
+pandas==2.3.2
+ipykernel==6.30.1
+
+# --- optional letter engines (uv sync --all-extras installs both) -------------
+# pytesseract==0.3.13          # plus the tesseract program:
+#                              #   Ubuntu: apt install tesseract-ocr tesseract-ocr-tha
+#                              #   macOS 15+: brew install tesseract
+#                              #   macOS 14 and older (no Homebrew build any more): conda-forge
+#                              #     micromamba create -p .tesseract -c conda-forge tesseract
+#                              #     ln -s ../../.tesseract/bin/tesseract .venv/bin/tesseract
+#                              #   Windows: UB-Mannheim installer, tick "Thai"
+#                              # tessdata/tha.traineddata (from tessdata_best) next to
+#                              # thai_plate_reader.py is used automatically
+# paddlepaddle==3.3.1          # PaddleOCR's Thai model (th_PP-OCRv5_mobile_rec, 8 MB),
+#                              #   downloads from Hugging Face on first use. Do NOT add
+#                              #   paddleocr: it pins opencv-contrib-python, which
+#                              #   overwrites opencv-python-headless
+
+# CPU-only server? Install the much smaller CPU build of torch first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# The Thai recogniser (thai.pth, ~215 MB) downloads to ~/.EasyOCR/model on first run.
+# For an offline server, copy that file and use:
+#   ThaiPlateReader(model_storage_directory="models/", download_enabled=False)
