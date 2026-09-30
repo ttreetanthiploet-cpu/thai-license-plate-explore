@@ -1,7 +1,7 @@
 # environments (rebuild with  uv sync --all-extras  or  pip install -r requirements.txt)
 .venv/
 .tesseract/
-
+final_data/
 # build and editor leftovers
 __pycache__/
 *.egg-info/

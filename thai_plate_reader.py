@@ -2,12 +2,20 @@
 """
 thai_plate_reader.py - offline Thai licence-plate reader built on EasyOCR.
 
-Layout assumed (standard 2-line car plate, plain or graphic background):
+Layouts (plain or graphic background), told apart by the plate's shape:
 
+    car, 34 x 15 cm, 2 lines
         +----------------------------+
         |  5กข       2662             |   <- top line : letters | number
         |       กรุงเทพมหานคร     (o)  |   <- bottom   : province (+ emblem)
         +----------------------------+
+
+    motorcycle, 22 x 17.2 cm, 3 lines
+        +------------------+
+        |      7ขห     (o)  |   <- letters (+ emblem)
+        |  กรุงเทพมหานคร     |   <- province
+        |      6769        |   <- number
+        +------------------+
 
 Pipeline
   1. plate_candidates() / warp_plate()
@@ -15,11 +23,12 @@ Pipeline
   2. segment_plate()  connected components -> crops
                         letters  : cut into single glyphs  [5] [ก] [ข]
                         number   : 1-4 digits
-                        province : bottom line, security emblem removed
+                        province : its own line, security emblem removed
   3. letters          each glyph is read ON ITS OWN by a letter engine
                       (EasyOCR / small CNN / Tesseract / PaddleOCR, or an
                       average of several), then the glyphs are combined and
                       checked against the plate format [digit?][consonant x1-2]
+                      (motorcycles issued before ~2013: 3 consonants, กขค 123)
   4. number/province  EasyOCR *recogniser only* (the CRAFT detector is never
                       loaded) with per-field allow-lists; the province is picked
                       by scoring all official names with the CTC likelihood
@@ -27,6 +36,7 @@ Pipeline
 CLI
   python thai_plate_reader.py car.jpg --debug debug.png
   python thai_plate_reader.py car.jpg --letters cnn          # or easyocr, easyocr+cnn ...
+  python thai_plate_reader.py bike.jpg --layout motorcycle   # default: auto
 
 Library
   from thai_plate_reader import ThaiPlateReader
@@ -34,8 +44,8 @@ Library
   result = reader.read("car.jpg")     # then ~1 s per plate on a 2-core CPU
   print(result["plate"], result["province"], result["needs_review"])
 
-Not covered: motorcycle plates (3-line layout), wide CCTV scenes (crop the
-plate with a detector first, then call read()).
+Not covered: wide CCTV scenes (crop the plate with a detector first, then
+call read()).
 """
 from __future__ import annotations
 
@@ -84,9 +94,23 @@ PROVINCE_CHARS = "".join(sorted(set("".join(PROVINCES))))
 
 # Top line: [optional digit] + 1-2 consonants,  then 1-4 digits (no leading 0)
 LETTERS_RE = re.compile(rf"^[1-9]?[{THAI_CONSONANTS}]{{1,2}}$")
+# motorcycles: the same, or 3 consonants on plates issued before ~2013 (กขค 123)
+MOTO_LETTERS_RE = re.compile(rf"^(?:[1-9]?[{THAI_CONSONANTS}]{{1,2}}|[{THAI_CONSONANTS}]{{3}})$")
 NUMBER_RE = re.compile(r"^[1-9][0-9]{0,3}$")
 
-PLATE_H = 220  # height (px) of the rectified plate; all ratios below use it
+PLATE_H = 220  # height (px) of the rectified car plate; ratios below are of the plate height
+
+# Plate layouts, tried in this order - the motorcycle one first because it needs
+# two lines of large characters, so it cannot mistake a car plate for one:
+#   motorcycle  22 x 17.2 cm, 3 lines: letters | province | number
+#   car         34 x 15 cm,   2 lines: letters + number | province
+# aspect: width / height of the plate face (frames hide part of it, a photo taken
+# from above shortens it); height: px of the rectified plate - the motorcycle
+# province line is small, so that plate is warped larger
+LAYOUTS = {
+    "motorcycle": dict(aspect=(1.1, 2.0), height=300, letters_re=MOTO_LETTERS_RE),
+    "car": dict(aspect=(1.5, 4.0), height=PLATE_H, letters_re=LETTERS_RE),
+}
 
 # Small CNN that classifies ONE letter glyph (see train_letter_cnn.py)
 LETTER_CNN_CLASSES = THAI_CONSONANTS + DIGITS
@@ -189,11 +213,17 @@ def _contour_quad(c):
     return _order_corners(cv2.boxPoints(cv2.minAreaRect(c)))
 
 
-def plate_candidates(bgr, max_candidates=4):
-    """Quadrilaterals that look like a plate face (light, rectangular,
-    1.5-4:1), most plate-like first; the whole image is always the last one.
+def _fitting_layouts(aspect, layouts):
+    return [name for name in layouts
+            if LAYOUTS[name]["aspect"][0] <= aspect <= LAYOUTS[name]["aspect"][1]]
 
-    Good for plate-centred photos (a phone shot of the plate / rear of car).
+
+def plate_candidates(bgr, max_candidates=4, layouts=tuple(LAYOUTS)):
+    """Quadrilaterals that look like a plate face (light, rectangular, shaped
+    like a plate of one of the layouts), most plate-like first, at most
+    max_candidates per layout; the whole image is always the last one.
+
+    Good for plate-centred photos (a phone shot of the plate / rear of vehicle).
     For wide CCTV-style scenes crop the plate with a detector (e.g. YOLO) first.
     """
     H, W = bgr.shape[:2]
@@ -215,17 +245,30 @@ def plate_candidates(bgr, max_candidates=4):
                 continue
             aspect = max(rw, rh) / min(rw, rh)
             rectangularity = area / (rw * rh)
-            # Thai car plate: 34 x 15 cm (2.27:1); holders hide part of it
-            if 1.5 <= aspect <= 4.0 and rectangularity >= 0.8:
-                found.append((area * rectangularity, _contour_quad(c)))
+            fits = _fitting_layouts(aspect, layouts)
+            if fits and rectangularity >= 0.8:
+                found.append((area * rectangularity, _contour_quad(c), fits))
 
-    quads = []
-    for _, q in sorted(found, key=lambda f: -f[0]):
+    quads, count = [], dict.fromkeys(layouts, 0)
+    for _, q, fits in sorted(found, key=lambda f: -f[0]):
+        if all(count[name] >= max_candidates for name in fits):
+            continue
         if all(np.abs(q - p).max() > 10 for p in quads):   # skip duplicates
             quads.append(q)
-    quads = quads[:max_candidates]
+            for name in fits:
+                count[name] += 1
     quads.append(np.float32([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]]))
     return quads
+
+
+def plate_layouts(quad, layouts=tuple(LAYOUTS), whole_image=False):
+    """Layouts to try on a plate candidate: the ones whose shape fits the quad;
+    all of them for the whole-image fallback, or when none fits."""
+    tl, tr, br, bl = quad
+    width = np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)
+    height = np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)
+    fits = _fitting_layouts(width / max(height, 1), layouts)
+    return list(layouts) if whole_image or not fits else fits
 
 
 def warp_plate(bgr, quad, out_h=PLATE_H):
@@ -266,12 +309,16 @@ def normalise_plate(plate_bgr):
     channels = [cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)] + list(cv2.split(plate_bgr))
     ch = max(channels, key=_otsu_separability)
 
-    # polarity: text should be the minority (darker) class
-    t, _ = cv2.threshold(ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if (ch <= t).mean() > 0.5:
+    k = max(15, int(0.15 * H)) | 1  # wider than a stroke, so closing = background
+
+    # polarity: text should be the minority (darker) class - judged with the
+    # shading removed, as a strong shadow can make most of the plate "dark"
+    flat = ch.astype(np.float32) - cv2.GaussianBlur(ch, (0, 0), k).astype(np.float32)
+    flat = cv2.normalize(flat, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    t, _ = cv2.threshold(flat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if (flat <= t).mean() > 0.5:
         ch = 255 - ch
 
-    k = max(15, int(0.15 * H)) | 1  # wider than a stroke, so closing = background
     background = cv2.morphologyEx(ch, cv2.MORPH_CLOSE,
                                   cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     norm = cv2.divide(ch, background, scale=255)
@@ -292,12 +339,9 @@ def _is_ring(mask):
     return hole / float(w * h) > 0.35
 
 
-def segment_plate(ink):
-    """Split the binary text mask into letters / number / province boxes.
-
-    Returns dict(letters=Box, number=Box, province=Box, labels=label_image,
-    n_letter_glyphs=int, n_number_glyphs=int).
-    """
+def _components(ink, speckle=0.0004):
+    """Connected components of the ink that can be characters -> (boxes, labels).
+    speckle: smallest component kept, as a fraction of the plate area."""
     H, W = ink.shape
     # erase long straight lines (printed border, holder edge) so that glyphs
     # touching them are not thrown away together with the frame
@@ -311,7 +355,7 @@ def segment_plate(ink):
     comps = []
     for i in range(1, n):
         x, y, w, h, area = stats[i]
-        if area < 0.0004 * H * W:                      # speckle
+        if area < speckle * H * W:                     # speckle
             continue
         if w > 0.5 * W or h > 0.8 * H:                 # frame / plate holder
             continue
@@ -321,46 +365,27 @@ def segment_plate(ink):
         if elongated and near_edge:                    # printed border line
             continue
         comps.append(Box(x, y, x + w, y + h, [i]))
+    return comps, labels
 
-    # ---- top line: the tall glyphs ------------------------------------------
-    tall = [c for c in comps if 0.25 * H <= c.h <= 0.8 * H and c.w <= 0.35 * W]
-    if len(tall) < 2:
-        raise PlateNotFound("could not find the large characters of the top line")
-    cy = np.median([c.cy for c in tall])
-    ch = np.median([c.h for c in tall])
-    if cy > 0.65 * H:
-        raise PlateNotFound("large characters are not in the upper part of the plate")
-    tall = [c for c in tall if abs(c.cy - cy) < 0.35 * ch]
-    top_y0, top_y1 = min(c.y0 for c in tall), max(c.y1 for c in tall)
 
+def _glyph_row(comps, tall):
+    """The tall components of one line -> glyph boxes, left to right, with the
+    small pieces inside the line's band (detached tails, broken strokes) added."""
+    y0, y1 = min(c.y0 for c in tall), max(c.y1 for c in tall)
     glyphs = _merge_columns(tall)
-    # small pieces inside the top band (detached tails, broken strokes)
     tall_ids = {i for g in glyphs for i in g.ids}
     for c in comps:
-        if c.ids[0] in tall_ids or not (top_y0 <= c.cy <= top_y1):
+        if c.ids[0] in tall_ids or not (y0 <= c.cy <= y1):
             continue
         for gi, g in enumerate(glyphs):
             if c.x0 < g.x1 and c.x1 > g.x0:
                 glyphs[gi] = g.union(c)
                 break
-    if len(glyphs) < 2:
-        raise PlateNotFound("top line has fewer than two glyphs")
+    return glyphs
 
-    # letters | number are separated by the widest gap; prefer splits that
-    # respect the format (1-3 glyphs on the left, 1-4 on the right)
-    gaps = [glyphs[i + 1].x0 - glyphs[i].x1 for i in range(len(glyphs) - 1)]
-    valid = [i for i in range(len(gaps))
-             if 1 <= i + 1 <= 3 and 1 <= len(glyphs) - (i + 1) <= 4]
-    split = max(valid or range(len(gaps)), key=lambda i: gaps[i])
-    letters = _union_all(glyphs[:split + 1])
-    number = _union_all(glyphs[split + 1:])
 
-    # ---- bottom line: province ------------------------------------------------
-    used = {i for g in glyphs for i in g.ids}
-    low = [c for c in comps
-           if c.ids[0] not in used and c.y0 >= top_y1 - 0.03 * H and c.h < 0.6 * ch]
-    if not low:
-        raise PlateNotFound("no province line found under the registration number")
+def _province_box(low, labels):
+    """The province word among the small components of its line."""
     cols = _merge_columns(low)
     ph = np.percentile([c.h for c in low], 75)          # typical glyph height
     clusters = [[cols[0]]]
@@ -379,11 +404,102 @@ def segment_plate(ink):
             mask = np.isin(labels[b.y0:b.y1, b.x0:b.x1], b.ids).astype(np.uint8) * 255
             if _is_ring(mask):
                 words.pop(end)
-    province = _union_all(words)
+    return _union_all(words)
 
-    return dict(letters=letters, number=number, province=province, labels=labels,
-                letter_glyphs=glyphs[:split + 1], number_glyphs=glyphs[split + 1:],
-                n_letter_glyphs=split + 1, n_number_glyphs=len(glyphs) - split - 1)
+
+def _segment_car(comps, labels, H, W):
+    """2 lines: letters + number on top, province below."""
+    # ---- top line: the tall glyphs ------------------------------------------
+    tall = [c for c in comps if 0.25 * H <= c.h <= 0.8 * H and c.w <= 0.35 * W]
+    if len(tall) < 2:
+        raise PlateNotFound("could not find the large characters of the top line")
+    cy = np.median([c.cy for c in tall])
+    ch = np.median([c.h for c in tall])
+    if cy > 0.65 * H:
+        raise PlateNotFound("large characters are not in the upper part of the plate")
+    tall = [c for c in tall if abs(c.cy - cy) < 0.35 * ch]
+    glyphs = _glyph_row(comps, tall) if tall else []
+    if len(glyphs) < 2:
+        raise PlateNotFound("top line has fewer than two glyphs")
+
+    # letters | number are separated by the widest gap; prefer splits that
+    # respect the format (1-3 glyphs on the left, 1-4 on the right)
+    gaps = [glyphs[i + 1].x0 - glyphs[i].x1 for i in range(len(glyphs) - 1)]
+    valid = [i for i in range(len(gaps))
+             if 1 <= i + 1 <= 3 and 1 <= len(glyphs) - (i + 1) <= 4]
+    split = max(valid or range(len(gaps)), key=lambda i: gaps[i])
+
+    # ---- bottom line: province ------------------------------------------------
+    top_y1 = max(c.y1 for c in tall)
+    used = {i for g in glyphs for i in g.ids}
+    low = [c for c in comps
+           if c.ids[0] not in used and c.y0 >= top_y1 - 0.03 * H and c.h < 0.6 * ch]
+    if not low:
+        raise PlateNotFound("no province line found under the registration number")
+    return glyphs[:split + 1], glyphs[split + 1:], _province_box(low, labels)
+
+
+def _segment_motorcycle(comps, labels, H, W):
+    """3 lines: letters, province, number."""
+    # ---- letters (top) and number (bottom): two lines of large glyphs --------
+    big = [c for c in comps if 0.15 * H <= c.h <= 0.45 * H and c.w <= 0.3 * W]
+    if len(big) < 2:
+        raise PlateNotFound("could not find the large characters")
+    ch = np.median([c.h for c in big])
+    big = sorted((c for c in big if c.h >= 0.75 * ch), key=lambda c: c.cy)
+    # the province line lies between them -> they are split by the widest gap
+    gaps = [b.cy - a.cy for a, b in zip(big, big[1:])]
+    if not gaps or max(gaps) < 1.2 * ch:
+        raise PlateNotFound("large characters do not form two lines")
+    k = int(np.argmax(gaps)) + 1
+    rows = []
+    for row in (big[:k], big[k:]):
+        cy = np.median([c.cy for c in row])
+        rows.append([c for c in row if abs(c.cy - cy) < 0.35 * ch])
+    top, bottom = rows
+    if not (top and bottom and
+            np.median([c.cy for c in top]) < 0.5 * H < np.median([c.cy for c in bottom])):
+        raise PlateNotFound("the lines of large characters are not above and below the middle")
+    ratio = np.median([c.h for c in top]) / np.median([c.h for c in bottom])
+    if not 0.75 <= ratio <= 1.33:
+        raise PlateNotFound("letters and number lines differ in size")
+    letter_glyphs, number_glyphs = _glyph_row(comps, top), _glyph_row(comps, bottom)
+
+    # ---- middle line: province -----------------------------------------------
+    top_y1 = max(c.y1 for c in top)
+    bottom_y0 = min(c.y0 for c in bottom)
+    used = {i for g in letter_glyphs + number_glyphs for i in g.ids}
+    low = [c for c in comps
+           if c.ids[0] not in used and c.h < 0.7 * ch
+           and c.y0 >= top_y1 - 0.03 * H and c.y1 <= bottom_y0 + 0.03 * H]
+    if not low:
+        raise PlateNotFound("no province line found between the letters and the number")
+    return letter_glyphs, number_glyphs, _province_box(low, labels)
+
+
+def segment_plate(ink, layout="car"):
+    """Split the binary text mask into letters / number / province boxes.
+    layout: "car" (2 lines) or "motorcycle" (3 lines), see LAYOUTS.
+
+    Returns dict(letters=Box, number=Box, province=Box, labels=label_image,
+    letter_glyphs=[Box], number_glyphs=[Box], n_letter_glyphs=int,
+    n_number_glyphs=int, layout=str).
+    """
+    H, W = ink.shape
+    if layout == "car":
+        comps, labels = _components(ink)
+        letter_glyphs, number_glyphs, province = _segment_car(comps, labels, H, W)
+    elif layout == "motorcycle":
+        # the province line is small: keep its tiny vowel marks
+        comps, labels = _components(ink, speckle=0.0002)
+        letter_glyphs, number_glyphs, province = _segment_motorcycle(comps, labels, H, W)
+    else:
+        raise ValueError(f"unknown layout {layout!r}; choose from {tuple(LAYOUTS)}")
+    return dict(letters=_union_all(letter_glyphs), number=_union_all(number_glyphs),
+                province=province, labels=labels,
+                letter_glyphs=letter_glyphs, number_glyphs=number_glyphs,
+                n_letter_glyphs=len(letter_glyphs), n_number_glyphs=len(number_glyphs),
+                layout=layout)
 
 
 def field_crop(norm, ink, labels, box, pad_frac=0.12, pad_x_frac=None):
@@ -417,11 +533,12 @@ def glyph_crop(norm, ink, labels, box):
 # string of characters permitted at position i. The per-glyph results are then
 # combined into the letter string (see combine_letters).
 
-def letter_allowed_sets(n):
+def letter_allowed_sets(n, layout="car"):
     """Allowed characters per letter position, from the plate format
-    [optional digit 1-9] + 1-2 consonants."""
+    [optional digit 1-9] + 1-2 consonants (motorcycles: or 3 consonants)."""
     if n >= 3:
-        return ["123456789"] + [THAI_CONSONANTS] * (n - 1)
+        first = (THAI_CONSONANTS if layout == "motorcycle" else "") + "123456789"
+        return [first] + [THAI_CONSONANTS] * (n - 1)
     if n == 2:
         return [THAI_CONSONANTS + "123456789", THAI_CONSONANTS]
     return [THAI_CONSONANTS] * n
@@ -678,13 +795,18 @@ class ThaiPlateReader:
                              (ENGINE_WEIGHTS); disagreement sets needs_review
         "group"              old behaviour: EasyOCR reads the letters crop in one go
         "auto" (default)     "easyocr+cnn" if the CNN weights exist, else "easyocr"
+    layout - "auto" (default): car or motorcycle plate, told apart by the plate's
+        shape; "car" or "motorcycle" to accept only that layout
     reader_kwargs are passed to easyocr.Reader - e.g. a fine-tuned model:
         ThaiPlateReader(recog_network="thai_plate", user_network_directory="models/",
                         model_storage_directory="models/")
     """
 
     def __init__(self, gpu=False, langs=("th",), letters_engine="auto", cnn_weights=None,
-                 tessdata_dir=None, **reader_kwargs):
+                 tessdata_dir=None, layout="auto", **reader_kwargs):
+        if layout != "auto" and layout not in LAYOUTS:
+            raise ValueError(f"unknown layout {layout!r}; choose from auto, {', '.join(LAYOUTS)}")
+        self.layouts = tuple(LAYOUTS) if layout == "auto" else (layout,)
         import easyocr
         import easyocr.easyocr as _eo
         import torch
@@ -851,13 +973,18 @@ class ThaiPlateReader:
         if bgr is None:
             raise FileNotFoundError(image)
 
-        # try plate-like regions in turn; keep the first with a valid layout
+        # try plate-like regions in turn, each with the layouts its shape fits;
+        # keep the first that segments into a valid layout
         error = None
-        for quad in plate_candidates(bgr):
-            plate = warp_plate(bgr, quad)
+        quads = plate_candidates(bgr, layouts=self.layouts)
+        attempts = [(quad, layout) for n, quad in enumerate(quads)
+                    for layout in plate_layouts(quad, self.layouts,
+                                                whole_image=n == len(quads) - 1)]
+        for quad, layout in attempts:
+            plate = warp_plate(bgr, quad, LAYOUTS[layout]["height"])
             norm, ink = normalise_plate(plate)
             try:
-                seg = segment_plate(ink)
+                seg = segment_plate(ink, layout)
                 break
             except PlateNotFound as e:
                 error = e
@@ -875,10 +1002,11 @@ class ThaiPlateReader:
         per_letter = (self.letters_engine != "group" and 1 <= len(boxes) <= 3
                       and all(b.w <= 1.3 * b.h for b in boxes))
         if per_letter:
-            letters = self.read_letters(glyphs)
+            letters = self.read_letters(glyphs, layout=layout)
             mode = f"per-letter ({letters['engine']})"
         else:
-            letters = self.read_code(crops["letters"], THAI_CONSONANTS + DIGITS, LETTERS_RE)
+            letters = self.read_code(crops["letters"], THAI_CONSONANTS + DIGITS,
+                                     LAYOUTS[layout]["letters_re"])
             mode = "whole crop (easyocr)" + ("" if self.letters_engine == "group" else ", fallback")
         t2 = time.perf_counter()
         number = self.read_code(crops["number"], DIGITS, NUMBER_RE)
@@ -900,6 +1028,7 @@ class ThaiPlateReader:
                         province["similarity"] < 0.6)
         result = {
             "plate": f"{letters['text']} {number['text']}",
+            "layout": layout,
             "letters": letters["text"],
             "number": number["text"],
             "province": province["text"],
@@ -933,12 +1062,12 @@ class ThaiPlateReader:
                                     ink=ink, seg=seg, crops=crops, glyphs=glyphs)
         return result
 
-    def read_letters(self, glyphs, engine=None):
+    def read_letters(self, glyphs, engine=None, layout="car"):
         """Read letter glyphs ONE AT A TIME with a letters engine, then combine."""
         engine = engine or self.letters_engine
-        allowed = letter_allowed_sets(len(glyphs))
+        allowed = letter_allowed_sets(len(glyphs), layout)
         dists = engine.predict(glyphs, allowed)
-        out = combine_letters(dists, allowed)
+        out = combine_letters(dists, allowed, LAYOUTS[layout]["letters_re"])
         out["engine"] = engine.name
         if isinstance(engine, EnsembleLetters):
             out["by_engine"] = {name: "".join(al[int(np.argmax(p))] for p, al in zip(ds, allowed))
@@ -1006,6 +1135,8 @@ def main(argv=None):
     ap.add_argument("--letters", default="auto",
                     help="letters engine: easyocr | cnn | tesseract | paddle | group | "
                          "easyocr+cnn (any '+' combination) | auto (default)")
+    ap.add_argument("--layout", default="auto", choices=("auto",) + tuple(LAYOUTS),
+                    help="plate layout: car (2 lines), motorcycle (3 lines) or auto (default)")
     ap.add_argument("--tessdata-dir", help="folder with tha.traineddata (tesseract engine; "
                                            "default: tessdata/ next to this file, if present)")
     ap.add_argument("--debug", help="write a debug sheet (single image) or a folder for many")
@@ -1020,7 +1151,7 @@ def main(argv=None):
 
     t = time.perf_counter()
     reader = ThaiPlateReader(gpu=args.gpu, letters_engine=args.letters,
-                             tessdata_dir=args.tessdata_dir)
+                             tessdata_dir=args.tessdata_dir, layout=args.layout)
     print(f"model loaded in {time.perf_counter() - t:.1f}s", file=sys.stderr)
 
     for path in args.images:
@@ -1048,7 +1179,7 @@ def main(argv=None):
             print(json.dumps({"image": path, **res}, ensure_ascii=False, indent=2))
         else:
             flag = "  [review]" if res["needs_review"] else ""
-            print(f"{path}: {res['plate']}  {res['province']}  "
+            print(f"{path}: {res['plate']}  {res['province']}  [{res['layout']}]  "
                   f"(conf L={res['confidence']['letters']:.2f} "
                   f"N={res['confidence']['number']:.2f} "
                   f"P={res['confidence']['province']:.2f}, "
