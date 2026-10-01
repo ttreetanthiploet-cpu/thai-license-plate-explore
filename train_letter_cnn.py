@@ -169,8 +169,10 @@ def augment(glyph, rng, size=LETTER_CNN_SIZE):
     y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
     hh = y1 - y0
     j = lambda: int(round(hh * rng.uniform(-0.02, 0.06)))
-    y0, y1 = max(0, y0 - j()), min(H, y1 + j())
-    x0, x1 = max(0, x0 - j()), min(W, x1 + j())
+    jy0, jy1 = max(0, y0 - j()), min(H, y1 + j())
+    jx0, jx1 = max(0, x0 - j()), min(W, x1 + j())
+    if jy1 > jy0 and jx1 > jx0:   # a thin real glyph (a "1" a few pixels wide) can vanish
+        y0, y1, x0, x1 = jy0, jy1, jx0, jx1
     g = g[y0:y1, x0:x1]
 
     # low resolution + blur
@@ -274,6 +276,9 @@ def main():
     ap.add_argument("--holdout", default="", help="comma-separated font name prefixes kept for validation")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--per-glyph", type=int, default=6, help="augmented samples per rendered glyph per epoch")
+    ap.add_argument("--real-repeat", type=int, default=20,
+                    help="real glyphs get this many times more samples than rendered ones "
+                         "(lower it when --real holds thousands of glyphs)")
     ap.add_argument("--out", default="thai_letter_cnn.pt")
     args = ap.parse_args()
 
@@ -299,7 +304,8 @@ def main():
         bases += real
     print(f"{len(bases)} training glyph renders, {len(val)} held-out "
           f"({len({b[2] for b in bases})} font styles) in {time.time() - t:.0f}s")
-    train(bases, val, args.out, epochs=args.epochs, per_base=args.per_glyph)
+    train(bases, val, args.out, epochs=args.epochs, per_base=args.per_glyph,
+          real_repeat=args.real_repeat)
 
 
 if __name__ == "__main__":
